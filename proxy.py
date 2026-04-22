@@ -105,7 +105,7 @@ class UpstreamProxy:
         if payload.get("stop_sequences") is not None:
             translated["stop"] = payload["stop_sequences"]
         effort_level = payload.get("effortLevel") or payload.get("thinking", {}).get("effort")
-        print(f"effort_level {effort_level}, effortLevel={payload.get('effortLevel')}, thinking={payload.get('thinking')} payload {payload}")
+        #print(f"effort_level {effort_level}, effortLevel={payload.get('effortLevel')}, thinking={payload.get('thinking')} payload {payload}")
         if 1 or effort_level:
             translated["reasoning"] = {"effort": "xhigh"}
         return translated
