@@ -47,6 +47,18 @@ class UpstreamProxy:
             "Content-Type": "application/json",
         }
 
+    def build_timeout_error(self, *, url: str, path: str, model: str | None, stream: bool) -> dict[str, Any]:
+        return {
+            "error": {
+                "message": f"upstream timeout after {settings.request_timeout_seconds}s",
+                "type": "upstream_timeout",
+                "upstream_url": url,
+                "upstream_path": path,
+                "upstream_model": model,
+                "stream": stream,
+            }
+        }
+
     def anthropic_block_to_text(self, block: Any) -> str:
         if isinstance(block, str):
             return block
@@ -143,13 +155,26 @@ class UpstreamProxy:
         forwarded_payload = self.normalize_payload(payload, target)
         url = self.build_url(target.path)
         headers = self.build_headers()
-        logger.info("forwarding request path={} upstream_model={} stream={}", target.path, target.model, forwarded_payload.get("stream"))
+        stream = bool(forwarded_payload.get("stream"))
+        logger.info("forwarding request path={} upstream_url={} upstream_model={} stream={}", target.path, url, target.model, stream)
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 response = await client.post(url, json=forwarded_payload, headers=headers)
+        except httpx.ReadTimeout:
+            logger.exception("upstream read timeout path={} upstream_url={} upstream_model={} stream={}", target.path, url, target.model, stream)
+            return self.build_timeout_error(url=url, path=target.path, model=target.model, stream=stream), 504, {"content-type": "application/json"}
         except httpx.HTTPError as exc:
-            logger.exception("upstream request failed")
-            return {"error": {"message": str(exc), "type": "upstream_connection_error"}}, 502, {"content-type": "application/json"}
+            logger.exception("upstream request failed path={} upstream_url={} upstream_model={} stream={}", target.path, url, target.model, stream)
+            return {
+                "error": {
+                    "message": str(exc),
+                    "type": "upstream_connection_error",
+                    "upstream_url": url,
+                    "upstream_path": target.path,
+                    "upstream_model": target.model,
+                    "stream": stream,
+                }
+            }, 502, {"content-type": "application/json"}
 
         content_type = response.headers.get("content-type", "application/json")
         try:
@@ -172,13 +197,28 @@ class UpstreamProxy:
         forwarded_payload = self.normalize_payload(payload, target)
         url = self.build_url(target.path)
         headers = self.build_headers()
-        logger.info("streaming request path={} upstream_model={}", target.path, target.model)
+        logger.info("streaming request path={} upstream_url={} upstream_model={}", target.path, url, target.model)
         client = httpx.AsyncClient(timeout=self._timeout)
         try:
             async with client.stream("POST", url, json=forwarded_payload, headers=headers) as response:
                 async for chunk in response.aiter_bytes():
                     if chunk:
                         yield chunk
+        except httpx.ReadTimeout:
+            logger.exception("upstream streaming read timeout path={} upstream_url={} upstream_model={}", target.path, url, target.model)
+            yield json.dumps(self.build_timeout_error(url=url, path=target.path, model=target.model, stream=True)).encode("utf-8")
+        except httpx.HTTPError as exc:
+            logger.exception("upstream streaming request failed path={} upstream_url={} upstream_model={}", target.path, url, target.model)
+            yield json.dumps({
+                "error": {
+                    "message": str(exc),
+                    "type": "upstream_connection_error",
+                    "upstream_url": url,
+                    "upstream_path": target.path,
+                    "upstream_model": target.model,
+                    "stream": True,
+                }
+            }).encode("utf-8")
         finally:
             await client.aclose()
 
@@ -186,7 +226,7 @@ class UpstreamProxy:
         translated = self.anthropic_to_responses_payload(payload)
         url = self.build_url(settings.responses_path)
         headers = self.build_headers()
-        logger.info("streaming anthropic messages upstream_model={} effortLevel={}", translated.get("model"), payload.get("effortLevel"))
+        logger.info("streaming anthropic messages upstream_url={} upstream_model={} effortLevel={}", url, translated.get("model"), payload.get("effortLevel"))
         client = httpx.AsyncClient(timeout=self._timeout)
         try:
             yield b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_liteproxyllm\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"liteproxyllm\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n"
@@ -217,6 +257,22 @@ class UpstreamProxy:
             yield b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
             yield b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":0}}\n\n"
             yield b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        except httpx.ReadTimeout:
+            logger.exception("upstream anthropic streaming read timeout upstream_url={} upstream_model={}", url, translated.get("model"))
+            yield b"event: error\ndata: " + json.dumps({"type": "error", "error": self.build_timeout_error(url=url, path=settings.responses_path, model=translated.get("model"), stream=True)}).encode("utf-8") + b"\n\n"
+        except httpx.HTTPError as exc:
+            logger.exception("upstream anthropic streaming request failed upstream_url={} upstream_model={}", url, translated.get("model"))
+            yield b"event: error\ndata: " + json.dumps({
+                "type": "error",
+                "error": {
+                    "message": str(exc),
+                    "type": "upstream_connection_error",
+                    "upstream_url": url,
+                    "upstream_path": settings.responses_path,
+                    "upstream_model": translated.get("model"),
+                    "stream": True,
+                },
+            }).encode("utf-8") + b"\n\n"
         finally:
             await client.aclose()
 
